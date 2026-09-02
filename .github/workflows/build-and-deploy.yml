@@ -1,0 +1,193 @@
+# Reusable workflow: build a service image and record its tag for DEV.
+#
+# Called from each application repository. The caller stays ~10 lines, so fifty
+# repositories do not each carry a copy of this logic.
+#
+#   jobs:
+#     deploy:
+#       uses: EU-FarmBook/ci-workflows/.github/workflows/build-and-deploy.yml@main
+#       with:
+#         service: pagesense
+#       secrets: inherit
+#
+# ── What it does ──────────────────────────────────────────────────────────────
+# ── Why this lives in its own PUBLIC repository ───────────────────────────────
+# It started in eufarmbook-platform, which is private — and a public repository
+# cannot call a reusable workflow stored in a private one. The application repos
+# are public (they have to be: organisation secrets are not available to private
+# repositories on this GitHub plan), so the workflow had to move somewhere they
+# can reach.
+#
+# Nothing secret lives here. This file describes HOW a deployment happens; the
+# credential that lets it happen is PLATFORM_REPO_TOKEN, held by the caller and
+# passed in with `secrets: inherit`. The platform repository stays private.
+#
+# Builds the image, tags it with the commit SHA, pushes it to GHCR, then commits
+# that tag into the platform repository's `dev` branch. Argo CD sees the commit
+# and deploys to DEV. Nothing here can reach PRD: that needs a dev → main merge
+# and a deliberate Sync. See argocd/PROMOTION.md.
+name: build and deploy to DEV
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: "Directory under base/apps/ AND the image name in GHCR."
+        required: true
+        type: string
+      dockerfile:
+        description: "Path to the Dockerfile, if not ./Dockerfile."
+        required: false
+        default: "Dockerfile"
+        type: string
+      context:
+        description: "Build context."
+        required: false
+        default: "."
+        type: string
+      build_args:
+        description: "Newline-separated build args, e.g. PRELOAD_AGRI_MODEL=true"
+        required: false
+        default: ""
+        type: string
+      platform_ref:
+        description: "Branch of the platform repo to write the tag into."
+        required: false
+        default: "dev"
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: eu-farmbook
+  PLATFORM_REPO: EU-FarmBook/eufarmbook-platform
+
+jobs:
+  build-and-record:
+    runs-on: ubuntu-latest
+    # Two runs of the same service must not race each other into the platform
+    # repository. Different services may run concurrently.
+    concurrency:
+      group: deploy-${{ inputs.service }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Check out the application
+        uses: actions/checkout@v4
+
+      - name: Work out the tag
+        id: tag
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # Scoped to this repository and expires with the job — no long-lived
+          # registry credential is stored anywhere.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          # The commit SHA only. No `latest`: Argo CD detects change by diffing
+          # manifests, so a moving tag would deploy nothing, and a pod that
+          # restarted later would silently pick up different code.
+          tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:${{ steps.tag.outputs.sha }}
+          build-args: ${{ inputs.build_args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check out the platform repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PLATFORM_REPO }}
+          ref: ${{ inputs.platform_ref }}
+          # Organisation secret: a fine-grained token with contents:write on the
+          # platform repo only. It can reach DEV and nothing else — promotion to
+          # PRD still requires a human merge and a manual Sync.
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+          path: platform
+
+      - name: Record the new tag
+        id: record
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          f="base/apps/${{ inputs.service }}/deployment.yaml"
+          [ -f "$f" ] || { echo "::error::$f does not exist — is the service staged in the platform repo?"; exit 1; }
+
+          new="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:${{ steps.tag.outputs.sha }}"
+          old=$(grep -oE "image: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:\S+" "$f" | head -1 | sed 's/^image: //')
+          echo "current: ${old:-none}"
+          echo "new:     $new"
+
+          if [ "$old" = "$new" ]; then
+            echo "unchanged=true" >> "$GITHUB_OUTPUT"
+            echo "Tag is already current — nothing to commit."
+            exit 0
+          fi
+
+          sed -i "s|image: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:.*|image: $new|" "$f"
+          echo "unchanged=false" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to commit something that does not render
+        if: steps.record.outputs.unchanged == 'false'
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz \
+            | tar xz -C /usr/local/bin kustomize
+
+          # This is the check that was missing when an empty shell variable
+          # produced `image: …/pagesense:` — a bare trailing colon, invalid YAML.
+          # Argo could not render the DEV overlay at all, so nothing could sync.
+          out=$(kustomize build overlays/dev)
+
+          printf '%s' "$out" | grep -qE '^\s*image: [^ ]*:\s*$' \
+            && { echo "::error::an image has an empty tag"; exit 1; }
+          printf '%s' "$out" | grep -qE 'PLACEHOLDER|PASTE_[A-Z_]*' \
+            && { echo "::error::the DEV overlay still contains a placeholder"; exit 1; }
+          echo "overlays/dev renders and is deployable"
+
+      - name: Commit the tag
+        if: steps.record.outputs.unchanged == 'false'
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          git config user.name  "eufarmbook-ci"
+          git config user.email "ci@eufarmbook.eu"
+          git add "base/apps/${{ inputs.service }}/deployment.yaml"
+          git commit -m "${{ inputs.service }}: deploy ${{ steps.tag.outputs.sha }}" \
+                     -m "From ${{ github.repository }}@${{ github.sha }}"
+
+          # Another service may have pushed while this job was building. Rebase
+          # and retry rather than failing the deploy.
+          for i in 1 2 3 4 5; do
+            git pull --rebase --quiet origin "${{ inputs.platform_ref }}" && \
+            git push origin HEAD:"${{ inputs.platform_ref }}" && exit 0
+            echo "push rejected, retrying ($i/5)"
+            sleep $((i * 5))
+          done
+          echo "::error::could not push the tag after 5 attempts"; exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ inputs.service }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:${{ steps.tag.outputs.sha }}\` |"
+            echo "| platform branch | \`${{ inputs.platform_ref }}\` |"
+            echo "| deployed to | DEV (automatically, within a few minutes) |"
+            echo "| PRD | unchanged — requires a dev → main merge and a manual Sync |"
+          } >> "$GITHUB_STEP_SUMMARY"
