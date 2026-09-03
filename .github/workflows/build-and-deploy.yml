@@ -8,7 +8,8 @@
 #       uses: EU-FarmBook/ci-workflows/.github/workflows/build-and-deploy.yml@main
 #       with:
 #         service: pagesense
-#       secrets: inherit
+#       secrets:
+#         PLATFORM_REPO_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
 #
 # ── What it does ──────────────────────────────────────────────────────────────
 # ── Why this lives in its own PUBLIC repository ───────────────────────────────
@@ -20,7 +21,7 @@
 #
 # Nothing secret lives here. This file describes HOW a deployment happens; the
 # credential that lets it happen is PLATFORM_REPO_TOKEN, held by the caller and
-# passed in with `secrets: inherit`. The platform repository stays private.
+# passed in by name. The platform repository stays private.
 #
 # Builds the image, tags it with the commit SHA, pushes it to GHCR, then commits
 # that tag into the platform repository's `dev` branch. Argo CD sees the commit
@@ -55,6 +56,13 @@ on:
         required: false
         default: "dev"
         type: string
+    # Declared explicitly so a caller can pass this one secret by name instead
+    # of `secrets: inherit`, which forwards every secret the caller can see. A
+    # named secret is only delivered if the called workflow declares it here.
+    secrets:
+      PLATFORM_REPO_TOKEN:
+        description: "Fine-grained token with contents:write on the platform repository."
+        required: true
 
 env:
   REGISTRY: ghcr.io
