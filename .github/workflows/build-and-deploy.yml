@@ -158,13 +158,41 @@ jobs:
           # This is the check that was missing when an empty shell variable
           # produced `image: …/pagesense:` — a bare trailing colon, invalid YAML.
           # Argo could not render the DEV overlay at all, so nothing could sync.
-          out=$(kustomize build overlays/dev)
+          # Every overlay, not just dev: the tag is committed for dev, but the
+          # change that produced it lives in base/ and breaks all three.
+          bad=0
+          for e in dev qlt prd; do
+            out=$(kustomize build "overlays/$e") || {
+              echo "::error::overlays/$e does not render"; bad=1; continue; }
 
-          printf '%s' "$out" | grep -qE '^\s*image: [^ ]*:\s*$' \
-            && { echo "::error::an image has an empty tag"; exit 1; }
-          printf '%s' "$out" | grep -qE 'PLACEHOLDER|PASTE_[A-Z_]*' \
-            && { echo "::error::the DEV overlay still contains a placeholder"; exit 1; }
-          echo "overlays/dev renders and is deployable"
+            # Counted into variables, NOT `printf | grep -q`.
+            #
+            # Under `set -o pipefail` (line 5) a -q that matches EARLY in a large
+            # input kills printf with SIGPIPE, the pipeline returns 141, the
+            # `&&` never fires, and the check passes while the fault is present.
+            # It is a race, so it looked reliable on small renders. `grep -c`
+            # reads all of its input and cannot trigger SIGPIPE.
+            n_tag=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*image: [^ ]*:[[:space:]]*$' || true)
+            n_ang=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*image: .*[<>]' || true)
+            n_ovr=$(printf '%s\n' "$out" | grep -c 'OVERRIDDEN-BY-OVERLAY' || true)
+            n_ph=$(printf  '%s\n' "$out" | grep -cE 'PLACEHOLDER|PASTE_[A-Z_]' || true)
+
+            [ "$n_tag" -gt 0 ] && { echo "::error::overlays/$e has an image with an empty tag"; bad=1; }
+            [ "$n_ang" -gt 0 ] && { echo "::error::overlays/$e has angle brackets in an image reference"; bad=1; }
+
+            # OVERRIDDEN-BY-OVERLAY marks a value an overlay MUST supply — a
+            # namespaced Traefik middleware reference. Unresolved it is a broken
+            # Ingress in ANY overlay, not an unfinished environment.
+            [ "$n_ovr" -gt 0 ] && { echo "::error::overlays/$e leaves OVERRIDDEN-BY-OVERLAY unresolved"; bad=1; }
+
+            # PLACEHOLDER is legitimate in an environment that is not yet built.
+            if [ "$n_ph" -gt 0 ] && [ "$e" = dev ]; then
+              echo "::error::the DEV overlay still contains a placeholder"; bad=1
+            fi
+            echo "overlays/$e: tags=$n_tag angle=$n_ang overridden=$n_ovr placeholders=$n_ph"
+          done
+          [ "$bad" -eq 0 ] || exit 1
+          echo "all overlays render and dev is deployable"
 
       - name: Commit the tag
         if: steps.record.outputs.unchanged == 'false'
