@@ -170,21 +170,25 @@ jobs:
           # means "does every Application in it render". Directories starting
           # with `_` are not Applications: `_env` holds the environment's values
           # and `_shared` is a kustomize Component; neither stands alone.
+          # Parts are appended to a file, not accumulated in a variable. A
+          # variable would need a literal newline and a `---` inside this YAML
+          # block scalar, and a line at column 0 is LESS indented than the block,
+          # which ends the scalar and starts a new YAML document. The step then
+          # runs a truncated script and fails with a shell error that says
+          # nothing about the cause.
+          #
+          # `kustomize build >> file` also avoids $(...) stripping the trailing
+          # newline, which would put the separator on the end of the last line of
+          # the previous document.
           render_env() {
-            _out=""
+            : > /tmp/render.yaml
             for _d in "overlays/$1"/*/; do
               case $(basename "$_d") in _*) continue ;; esac
               [ -f "$_d/kustomization.yaml" ] || continue
-              _r=$(kustomize build "$_d") || return 1
-              # Shell concatenation, never `echo`: sh's builtin interprets
-              # backslash escapes, so a config value containing a literal \n
-              # becomes a real newline, splits the surrounding quoted scalar and
-              # corrupts the YAML hundreds of lines away.
-              _out="${_out}
----
-${_r}"
+              kustomize build "$_d" >> /tmp/render.yaml || return 1
+              echo "---" >> /tmp/render.yaml
             done
-            printf '%s\n' "$_out"
+            cat /tmp/render.yaml
           }
 
           bad=0
