@@ -152,7 +152,11 @@ jobs:
         working-directory: platform
         run: |
           set -euo pipefail
-          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz \
+          # Match the version Argo CD's repo-server runs. A CI that validates
+          # with a different kustomize than the one that deploys can pass on
+          # something Argo cannot render, which is the exact failure this step
+          # exists to prevent.
+          curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
             | tar xz -C /usr/local/bin kustomize
 
           # This is the check that was missing when an empty shell variable
@@ -160,9 +164,32 @@ jobs:
           # Argo could not render the DEV overlay at all, so nothing could sync.
           # Every overlay, not just dev: the tag is committed for dev, but the
           # change that produced it lives in base/ and breaks all three.
+          # An environment is one kustomization per Argo CD Application, not one
+          # for the whole overlay — split on 6 Sep so a Degraded service cannot
+          # block every other service's sync. So "does this environment render"
+          # means "does every Application in it render". Directories starting
+          # with `_` are not Applications: `_env` holds the environment's values
+          # and `_shared` is a kustomize Component; neither stands alone.
+          render_env() {
+            _out=""
+            for _d in "overlays/$1"/*/; do
+              case $(basename "$_d") in _*) continue ;; esac
+              [ -f "$_d/kustomization.yaml" ] || continue
+              _r=$(kustomize build "$_d") || return 1
+              # Shell concatenation, never `echo`: sh's builtin interprets
+              # backslash escapes, so a config value containing a literal \n
+              # becomes a real newline, splits the surrounding quoted scalar and
+              # corrupts the YAML hundreds of lines away.
+              _out="${_out}
+---
+${_r}"
+            done
+            printf '%s\n' "$_out"
+          }
+
           bad=0
           for e in dev qlt prd; do
-            out=$(kustomize build "overlays/$e") || {
+            out=$(render_env "$e") || {
               echo "::error::overlays/$e does not render"; bad=1; continue; }
 
             # Counted into variables, NOT `printf | grep -q`.

@@ -88,10 +88,16 @@ services whose first push comes from CI.
 diffing manifests rather than polling the registry, so a moving tag would not
 trigger a deployment, and a restarted pod could silently run different code.
 
-**The workflow validates before committing.** It runs `kustomize build
-overlays/dev` and rejects empty image tags and unresolved placeholders. An
-invalid manifest blocks Argo CD from rendering the whole overlay, which stops
-deployment for every service in that application, not only the one that changed.
+**The workflow validates before committing.** Each environment is one
+kustomization per Argo CD Application, so it builds every `overlays/<env>/*`
+directory (skipping `_env` and `_shared`, which are not Applications) and
+rejects empty image tags and unresolved placeholders. It pins the same kustomize
+version Argo CD's repo-server runs: validating with a different one can pass
+something Argo cannot render, which is the failure this step exists to prevent.
+
+An invalid manifest stops Argo CD rendering that Application. Since the 6 Sep
+split that is one service rather than the whole namespace — but it is still the
+difference between a failed deploy and a deployed service.
 
 **Concurrency.** Runs are serialised per service. Pushes to the platform
 repository are rebased and retried to tolerate concurrent deployments of
