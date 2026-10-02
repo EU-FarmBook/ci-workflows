@@ -71,7 +71,12 @@ env:
 
 jobs:
   build-and-record:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: GitHub moves that label to Ubuntu 26 from
+    # 19 October 2026, and an image change under every service's build at once
+    # is not something to discover from a failed deploy. "Make room on the
+    # runner" below removes paths that exist on this image. Move deliberately,
+    # one test build first (README, Maintenance).
+    runs-on: ubuntu-24.04
     # Two runs of the same service must not race each other into the platform
     # repository. Different services may run concurrently.
     concurrency:
@@ -82,17 +87,36 @@ jobs:
       packages: write
 
     steps:
+      # Action versions: the current majors, all on Node 24 (2 Oct 2026). The
+      # Node 20 majors they replace were being forced onto Node 24 by GitHub
+      # with a deprecation warning on every run. checkout v6+ keeps the
+      # credentials it persists in a separate file that git still reads, so the
+      # pull and push to the platform repository below work as before.
       - name: Check out the application
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Work out the tag
         id: tag
         run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      # The runner's root disk has about 14 GB free, and a Debian image carrying
+      # LibreOffice, Tesseract's language packs, ffmpeg and a CPU torch wheel
+      # (agri-tag) needs more than that while BuildKit builds its two stages in
+      # parallel. Both agri-tag runs on 30 Sep 2026 died inside pip with
+      # "[Errno 28] No space left on device", with requirements.txt unchanged
+      # since the last green build: the image had not grown, the runner had.
+      # The runner ships toolchains no build here uses; removing them frees
+      # 25-30 GB in a few seconds. The df line is the evidence in the log.
+      - name: Make room on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          sudo docker image prune -af > /dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -101,7 +125,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
@@ -115,7 +139,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Check out the platform repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.PLATFORM_REPO }}
           ref: ${{ inputs.platform_ref }}
@@ -180,19 +204,29 @@ jobs:
           # `kustomize build >> file` also avoids $(...) stripping the trailing
           # newline, which would put the separator on the end of the last line of
           # the previous document.
+          #
+          # An environment that renders NOTHING is a failure, not a pass. Until
+          # 2 Oct 2026 this loop named `qlt`, renamed to `uat` on 16 Sep: the
+          # glob matched no directory, the render was empty, every count was
+          # zero, and the check reported success for an environment it never
+          # looked at. A check that cannot fail is not evidence.
           render_env() {
+            [ -d "overlays/$1" ] || { echo "::error::overlays/$1 does not exist" >&2; return 1; }
             : > /tmp/render.yaml
+            n=0
             for _d in "overlays/$1"/*/; do
               case $(basename "$_d") in _*) continue ;; esac
               [ -f "$_d/kustomization.yaml" ] || continue
               kustomize build "$_d" >> /tmp/render.yaml || return 1
               echo "---" >> /tmp/render.yaml
+              n=$((n + 1))
             done
+            [ "$n" -gt 0 ] || { echo "::error::overlays/$1 has no Application to render" >&2; return 1; }
             cat /tmp/render.yaml
           }
 
           bad=0
-          for e in dev qlt prd; do
+          for e in dev uat prd; do
             out=$(render_env "$e") || {
               echo "::error::overlays/$e does not render"; bad=1; continue; }
 
@@ -206,7 +240,9 @@ jobs:
             n_tag=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*image: [^ ]*:[[:space:]]*$' || true)
             n_ang=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*image: .*[<>]' || true)
             n_ovr=$(printf '%s\n' "$out" | grep -c 'OVERRIDDEN-BY-OVERLAY' || true)
-            n_ph=$(printf  '%s\n' "$out" | grep -cE 'PLACEHOLDER|PASTE_[A-Z_]' || true)
+            # SET_PER_OVERLAY is the third spelling of a placeholder, as the
+            # platform repository's pre-commit hook counts it since 15 Sep.
+            n_ph=$(printf  '%s\n' "$out" | grep -cE 'PLACEHOLDER|PASTE_[A-Z_]|SET_PER_OVERLAY' || true)
 
             [ "$n_tag" -gt 0 ] && { echo "::error::overlays/$e has an image with an empty tag"; bad=1; }
             [ "$n_ang" -gt 0 ] && { echo "::error::overlays/$e has angle brackets in an image reference"; bad=1; }

@@ -102,3 +102,31 @@ difference between a failed deploy and a deployed service.
 **Concurrency.** Runs are serialised per service. Pushes to the platform
 repository are rebased and retried to tolerate concurrent deployments of
 different services.
+
+## Maintenance
+
+**Versions (2 Oct 2026).** `actions/checkout@v7`, `docker/setup-buildx-action@v4`,
+`docker/login-action@v4`, `docker/build-push-action@v7`: the current majors, all on
+Node 24. The runner is pinned to `ubuntu-24.04` rather than `ubuntu-latest`, which
+GitHub moves to Ubuntu 26 from 19 October 2026. Move it deliberately: change the
+label on `main`, run one `@main` caller by hand (`gh workflow run deploy.yml
+--repo EU-FarmBook/<repo>`), and only then move `v1`.
+
+**Who uses what.** Callers pin either `@v1` (most) or `@main` (agri-tag, agri-gate,
+omnilingua at the time of writing). A push to `main` reaches the `@main` callers at
+their next run; `v1` is a tag and reaches the rest only when it is moved:
+
+```bash
+git tag -f v1 && git push -f origin v1
+```
+
+Test on an `@main` caller first, then move the tag, then run one `@v1` caller.
+A rerun of an unchanged commit rebuilds from cache, finds the tag already
+recorded, and commits nothing, so it is a safe test.
+
+**The render check must be able to fail.** It renders every environment named
+in its loop and fails when one is missing or renders nothing. Until 2 Oct 2026 it
+named `qlt`, renamed to `uat` on 16 September, and passed for an environment it
+never looked at. When an environment is added or renamed in the platform
+repository, change the loop here in the same week.
+
