@@ -7,12 +7,28 @@ own build and deployment logic.
 
 ## build-and-deploy.yml
 
-On a push to `main`, the workflow builds the service image, tags it with the
-commit SHA, pushes it to GHCR, and records that tag in the `dev` branch of
-`eufarmbook-platform`. Argo CD deploys the change to DEV.
+The workflow builds the service image, tags it with the commit SHA, pushes it
+to GHCR, and records that tag in `eufarmbook-platform`. Where it records the tag
+depends on `branch_model`.
 
-Production is not affected. Promotion requires a `dev` → `main` merge in
-`eufarmbook-platform` followed by a manual sync in Argo CD.
+| `branch_model` | Branch pushed | Tag recorded in | Deploys to |
+|---|---|---|---|
+| `legacy` (default) | whatever the caller triggers on | platform `dev`, `base/apps/<service>/deployment.yaml` | DEV |
+| `dev-main` | a branch in `dev_branches` (default `dev`) | platform `dev`, `base/apps/<service>/deployment.yaml` | DEV |
+| `dev-main` | `main` | platform `main`, `overlays/uat/_images` and `overlays/prd/_images` | UAT at once, PRD after a manual Sync |
+| `dev-main` | anything else | nothing: the run fails before building | — |
+
+`dev-main` is the model decided on 2 Oct 2026: every service repository has a
+`dev` branch for DEV and a `main` branch for UAT and PRD. `legacy` is the
+behaviour before that, kept as the default so that a repository changes only
+when its own `deploy.yml` opts in.
+
+A release from `main` reuses the image DEV already built when `main` points at a
+commit DEV built, so UAT and PRD run the bytes DEV tested. A merge commit is a
+new commit and is built.
+
+PRD is never changed by a workflow run. Its Argo CD Applications are not
+automated, so a recorded release waits for someone to press Sync.
 
 ### Usage
 
@@ -23,7 +39,7 @@ name: deploy
 
 on:
   push:
-    branches: [ main ]
+    branches: [ dev, main ]
   workflow_dispatch:
 
 jobs:
@@ -31,10 +47,25 @@ jobs:
     permissions:
       contents: read
       packages: write
-    uses: EU-FarmBook/ci-workflows/.github/workflows/build-and-deploy.yml@main
+    uses: EU-FarmBook/ci-workflows/.github/workflows/build-and-deploy.yml@v1
     with:
       service: pagesense
-    secrets: inherit
+      branch_model: dev-main
+    secrets:
+      PLATFORM_REPO_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
+```
+
+A repository that still calls its development branch something else lists both
+names until it is renamed, in the trigger and in `dev_branches`:
+
+```yaml
+on:
+  push:
+    branches: [ dev, develop, main ]
+...
+    with:
+      branch_model: dev-main
+      dev_branches: dev develop
 ```
 
 ### Inputs
@@ -45,7 +76,9 @@ jobs:
 | `dockerfile` | no | `Dockerfile` | Path to the Dockerfile |
 | `context` | no | `.` | Build context |
 | `build_args` | no | | Newline-separated build arguments |
-| `platform_ref` | no | `dev` | Branch of `eufarmbook-platform` to write the tag to |
+| `branch_model` | no | `legacy` | `legacy` or `dev-main`, as above |
+| `dev_branches` | no | `dev` | `dev-main` only: space-separated branches that deploy to DEV |
+| `platform_ref` | no | `dev` | `legacy` only: branch of `eufarmbook-platform` to write the tag to |
 
 Examples:
 
@@ -90,7 +123,7 @@ trigger a deployment, and a restarted pod could silently run different code.
 
 **The workflow validates before committing.** Each environment is one
 kustomization per Argo CD Application, so it builds every `overlays/<env>/*`
-directory (skipping `_env` and `_shared`, which are not Applications) and
+directory (skipping `_env`, `_shared` and `_images`, which are not Applications) and
 rejects empty image tags and unresolved placeholders. It pins the same kustomize
 version Argo CD's repo-server runs: validating with a different one can pass
 something Argo cannot render, which is the failure this step exists to prevent.
@@ -123,6 +156,13 @@ git tag -f v1 && git push -f origin v1
 Test on an `@main` caller first, then move the tag, then run one `@v1` caller.
 A rerun of an unchanged commit rebuilds from cache, finds the tag already
 recorded, and commits nothing, so it is a safe test.
+
+**The release files are CI's.** CI rewrites everything from the `images:` line
+to the end of `overlays/{uat,prd}/_images/kustomization.yaml`. An empty list is
+written `images: []`, because kustomize rejects a Component with no fields. After
+recording, the render check confirms that every reference to the image in the
+target environments carries the new tag. A release written where no Application
+reads it would otherwise pass and change nothing.
 
 **The render check must be able to fail.** It renders every environment named
 in its loop and fails when one is missing or renders nothing. Until 2 Oct 2026 it
