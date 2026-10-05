@@ -1,13 +1,15 @@
-# Reusable workflow: build a service image and record its tag in the platform
-# repository, for DEV or, from `main`, for UAT and PRD.
+# Reusable workflow: builds a service image, pushes it to GHCR tagged with the
+# commit SHA, and records the tag in the platform repository.
 #
-# Called from each application repository. The caller stays ~10 lines, so fifty
-# repositories do not each carry a copy of this logic.
+# branch_model:
+#   legacy    every triggering branch records the tag on platform `dev`
+#             (base/apps/<service>/deployment.yaml), which DEV deploys.
+#   dev-main  branches in dev_branches behave like legacy; `main` records the
+#             tag in overlays/uat/_images and overlays/prd/_images on platform
+#             `main`. UAT syncs automatically, PRD only after a manual Sync.
+#             Any other branch fails before building.
 #
-#   on:
-#     push:
-#       branches: [ dev, main ]
-#     workflow_dispatch:
+# Example caller:
 #   jobs:
 #     deploy:
 #       permissions: { contents: read, packages: write }
@@ -18,39 +20,8 @@
 #       secrets:
 #         PLATFORM_REPO_TOKEN: ${{ secrets.PLATFORM_REPO_TOKEN }}
 #
-# ── What it does ──────────────────────────────────────────────────────────────
-# Builds the image, tags it with the commit SHA, pushes it to GHCR, then records
-# that tag in eufarmbook-platform. WHERE it records it depends on branch_model:
-#
-#   legacy (the default, unchanged behaviour)
-#       any branch that triggers the caller → platform `dev`,
-#       base/apps/<service>/deployment.yaml → DEV deploys it.
-#
-#   dev-main (opt-in, decided 2 Oct 2026: `dev` for DEV, `main` for UAT/PRD)
-#       a branch named in dev_branches → exactly as legacy → DEV.
-#       `main` → platform `main`, overlays/{uat,prd}/_images → UAT deploys it
-#       automatically; PRD only when someone presses Sync in Argo CD.
-#       Any other branch → the run fails before building anything.
-#
-# Why release tags go into `_images` and not base/: the platform's `dev` → `main`
-# merge carries base/ with it, so a tag in base/ on `main` is whatever DEV was
-# running on the day of the merge. `_images` is a kustomize `images:` list that
-# overrides base/ in UAT and PRD only, and only CI's release runs write it.
-#
-# ── Why this lives in its own PUBLIC repository ───────────────────────────────
-# It started in eufarmbook-platform, which is private — and a public repository
-# cannot call a reusable workflow stored in a private one. The application repos
-# are public (they have to be: organisation secrets are not available to private
-# repositories on this GitHub plan), so the workflow had to move somewhere they
-# can reach.
-#
-# Nothing secret lives here. This file describes HOW a deployment happens; the
-# credential that lets it happen is PLATFORM_REPO_TOKEN, held by the caller and
-# passed in by name. The platform repository stays private.
-#
-# Nothing here can make PRD run new code by itself: PRD's Applications are never
-# automated, so a release recorded on `main` waits for a deliberate Sync. See
-# argocd/PROMOTION.md in the platform repository.
+# The repository is public so that public application repositories can call
+# this workflow. It holds no secrets; the caller passes PLATFORM_REPO_TOKEN.
 name: build and deploy
 
 on:
@@ -81,7 +52,7 @@ on:
         default: "dev"
         type: string
       branch_model:
-        description: "legacy (every trigger deploys to DEV) or dev-main (dev branches → DEV, main → UAT/PRD)."
+        description: "legacy (every trigger deploys to DEV) or dev-main (dev branches -> DEV, main -> UAT/PRD)."
         required: false
         default: "legacy"
         type: string
@@ -90,9 +61,7 @@ on:
         required: false
         default: "dev"
         type: string
-    # Declared explicitly so a caller can pass this one secret by name instead
-    # of `secrets: inherit`, which forwards every secret the caller can see. A
-    # named secret is only delivered if the called workflow declares it here.
+    # Declared so a caller can pass this secret by name instead of `secrets: inherit`.
     secrets:
       PLATFORM_REPO_TOKEN:
         description: "Fine-grained token with contents:write on the platform repository."
@@ -105,16 +74,9 @@ env:
 
 jobs:
   build-and-record:
-    # Pinned, not ubuntu-latest: GitHub moves that label to Ubuntu 26 from
-    # 19 October 2026, and an image change under every service's build at once
-    # is not something to discover from a failed deploy. "Make room on the
-    # runner" below removes paths that exist on this image. Move deliberately,
-    # one test build first (README, Maintenance).
+    # Pinned rather than ubuntu-latest, so a runner image change is deliberate.
     runs-on: ubuntu-24.04
-    # Two runs of the same service must not race each other into the platform
-    # repository. Different services may run concurrently. A dev run and a main
-    # run of the same service also wait for each other: harmless, and it keeps
-    # two builds of one commit from pushing the same tag at the same moment.
+    # One run per service at a time, so runs do not race on the platform repository.
     concurrency:
       group: deploy-${{ inputs.service }}
       cancel-in-progress: false
@@ -123,9 +85,7 @@ jobs:
       packages: write
 
     steps:
-      # First, before anything is built: a branch that deploys nowhere should
-      # fail in two seconds with its name in the error, not after a ten-minute
-      # build with a confusing push failure at the end.
+      # Fail early when the branch deploys nowhere.
       - name: Decide where this build goes
         id: route
         env:
@@ -158,13 +118,8 @@ jobs:
           esac
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "platform_ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "$REF_NAME → $mode, recorded on platform '$ref'"
+          echo "$REF_NAME -> $mode, recorded on platform '$ref'"
 
-      # Action versions: the current majors, all on Node 24 (2 Oct 2026). The
-      # Node 20 majors they replace were being forced onto Node 24 by GitHub
-      # with a deprecation warning on every run. checkout v6+ keeps the
-      # credentials it persists in a separate file that git still reads, so the
-      # pull and push to the platform repository below work as before.
       - name: Check out the application
         uses: actions/checkout@v7
 
@@ -177,22 +132,11 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          # Scoped to this repository and expires with the job — no long-lived
-          # registry credential is stored anywhere.
+          # Job-scoped token; no stored registry credential.
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # A release of a commit DEV already built ships THAT image, not a rebuild
-      # of it. When `main` is fast-forwarded to a tested `dev` commit, UAT and
-      # PRD then run the exact bytes DEV ran, and the release takes seconds.
-      # A merge commit has a new SHA, so it is built as usual.
-      #
-      # This assumes the image does not depend on the branch it was built from,
-      # which is true of every service whose build_args are the same for both.
-      # The front end's are not (NEXT_PUBLIC_* are compiled in), which is why its
-      # caller does not release from `main` until those move to runtime.
-      #
-      # Any failure to inspect — not found, or a registry error — falls through
-      # to a normal build, so this can only save a build, never skip a needed one.
+      # A release reuses the image DEV built from the same commit, so UAT and PRD
+      # run exactly what DEV tested. If it is missing, it is built as usual.
       - name: Reuse the image DEV built from this commit
         id: exists
         if: steps.route.outputs.mode == 'release'
@@ -200,20 +144,13 @@ jobs:
           img="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:${{ steps.tag.outputs.sha }}"
           if docker manifest inspect "$img" > /dev/null 2>&1; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::$img already exists — releasing that image without rebuilding"
+            echo "::notice::$img already exists - releasing that image without rebuilding"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "$img not in GHCR yet — building it"
+            echo "$img not in GHCR yet - building it"
           fi
 
-      # The runner's root disk has about 14 GB free, and a Debian image carrying
-      # LibreOffice, Tesseract's language packs, ffmpeg and a CPU torch wheel
-      # (agri-tag) needs more than that while BuildKit builds its two stages in
-      # parallel. Both agri-tag runs on 30 Sep 2026 died inside pip with
-      # "[Errno 28] No space left on device", with requirements.txt unchanged
-      # since the last green build: the image had not grown, the runner had.
-      # The runner ships toolchains no build here uses; removing them frees
-      # 25-30 GB in a few seconds. The df line is the evidence in the log.
+      # Frees disk space; larger images (agri-tag) otherwise run out of space.
       - name: Make room on the runner
         if: steps.exists.outputs.found != 'true'
         run: |
@@ -231,9 +168,7 @@ jobs:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
           push: true
-          # The commit SHA only. No `latest`: Argo CD detects change by diffing
-          # manifests, so a moving tag would deploy nothing, and a pod that
-          # restarted later would silently pick up different code.
+          # The commit SHA only, no moving `latest` tag.
           tags: ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ inputs.service }}:${{ steps.tag.outputs.sha }}
           build-args: ${{ inputs.build_args }}
           cache-from: type=gha
@@ -244,9 +179,7 @@ jobs:
         with:
           repository: ${{ env.PLATFORM_REPO }}
           ref: ${{ steps.route.outputs.platform_ref }}
-          # A fine-grained token with contents:write on the platform repo only.
-          # It can change what DEV and UAT run; PRD still requires a person to
-          # press Sync, because no PRD Application is automated.
+          # Token with contents:write on the platform repository.
           token: ${{ secrets.PLATFORM_REPO_TOKEN }}
           path: platform
 
@@ -263,7 +196,7 @@ jobs:
 
           if [ "$MODE" = dev ]; then
             f="base/apps/$SVC/deployment.yaml"
-            [ -f "$f" ] || { echo "::error::$f does not exist — is the service staged in the platform repo?"; exit 1; }
+            [ -f "$f" ] || { echo "::error::$f does not exist - is the service staged in the platform repo?"; exit 1; }
 
             new="$IMG:$TAG"
             old=$(grep -oE "image: $IMG:\S+" "$f" | head -1 | sed 's/^image: //') || true
@@ -273,7 +206,7 @@ jobs:
 
             if [ "$old" = "$new" ]; then
               echo "unchanged=true" >> "$GITHUB_OUTPUT"
-              echo "Tag is already current — nothing to commit."
+              echo "Tag is already current - nothing to commit."
               exit 0
             fi
 
@@ -283,15 +216,8 @@ jobs:
             exit 0
           fi
 
-          # ── release: overlays/uat/_images and overlays/prd/_images ──────────
-          # CI owns everything from the `images:` line to the end of each file
-          # and rewrites it whole: the entries it finds, this service's replaced
-          # or added, sorted by name, one fixed layout. Plain text rather than
-          # yq, because the empty list has to be `images: []` (kustomize rejects
-          # a Component with no fields as "kustomization.yaml is empty") and yq
-          # keeps that flow style when appending, which puts every service on
-          # one line. Tags are always quoted: a SHA of only digits would
-          # otherwise be read as a number.
+          # Release: rewrite the images: list in overlays/{uat,prd}/_images, sorted,
+          # tags quoted. Plain text rather than yq, so an empty list stays `images: []`.
           files=""
           for e in uat prd; do
             f="overlays/$e/_images/kustomization.yaml"
@@ -320,7 +246,7 @@ jobs:
 
           if [ -z "$files" ]; then
             echo "unchanged=true" >> "$GITHUB_OUTPUT"
-            echo "UAT and PRD already record this tag — nothing to commit."
+            echo "UAT and PRD already record this tag - nothing to commit."
             exit 0
           fi
           echo "unchanged=false" >> "$GITHUB_OUTPUT"
@@ -335,41 +261,13 @@ jobs:
           TAG: ${{ steps.tag.outputs.sha }}
         run: |
           set -euo pipefail
-          # Match the version Argo CD's repo-server runs. A CI that validates
-          # with a different kustomize than the one that deploys can pass on
-          # something Argo cannot render, which is the exact failure this step
-          # exists to prevent.
+          # The same kustomize version as Argo CD's repo-server.
           curl -sfL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.8.1/kustomize_v5.8.1_linux_amd64.tar.gz \
             | tar xz -C /usr/local/bin kustomize
 
-          # This is the check that was missing when an empty shell variable
-          # produced `image: …/pagesense:` — a bare trailing colon, invalid YAML.
-          # Argo could not render the DEV overlay at all, so nothing could sync.
-          # Every overlay, not just the one this run deploys to: a change in
-          # base/ breaks all three.
-          # An environment is one kustomization per Argo CD Application, not one
-          # for the whole overlay — split on 6 Sep so a Degraded service cannot
-          # block every other service's sync. So "does this environment render"
-          # means "does every Application in it render". Directories starting
-          # with `_` are not Applications: `_env` holds the environment's values,
-          # and `_shared` and `_images` are kustomize Components; none stands
-          # alone.
-          # Parts are appended to a file, not accumulated in a variable. A
-          # variable would need a literal newline and a `---` inside this YAML
-          # block scalar, and a line at column 0 is LESS indented than the block,
-          # which ends the scalar and starts a new YAML document. The step then
-          # runs a truncated script and fails with a shell error that says
-          # nothing about the cause.
-          #
-          # `kustomize build >> file` also avoids $(...) stripping the trailing
-          # newline, which would put the separator on the end of the last line of
-          # the previous document.
-          #
-          # An environment that renders NOTHING is a failure, not a pass. Until
-          # 2 Oct 2026 this loop named `qlt`, renamed to `uat` on 16 Sep: the
-          # glob matched no directory, the render was empty, every count was
-          # zero, and the check reported success for an environment it never
-          # looked at. A check that cannot fail is not evidence.
+          # Render every Application of every overlay and check the result.
+          # Directories starting with _ are components, not Applications.
+          # An environment that renders nothing is a failure.
           render_env() {
             [ -d "overlays/$1" ] || { echo "::error::overlays/$1 does not exist" >&2; return 1; }
             : > /tmp/render.yaml
@@ -393,26 +291,18 @@ jobs:
             out=$(render_env "$e") || {
               echo "::error::overlays/$e does not render"; bad=1; continue; }
 
-            # Counted into variables, NOT `printf | grep -q`.
-            #
-            # Under `set -o pipefail` (line 5) a -q that matches EARLY in a large
-            # input kills printf with SIGPIPE, the pipeline returns 141, the
-            # `&&` never fires, and the check passes while the fault is present.
-            # It is a race, so it looked reliable on small renders. `grep -c`
-            # reads all of its input and cannot trigger SIGPIPE.
+            # grep -c rather than grep -q: under pipefail an early -q exit can
+            # SIGPIPE printf and hide a failure.
             n_tag=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*image: [^ ]*:[[:space:]]*$' || true)
             n_ang=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*image: .*[<>]' || true)
             n_ovr=$(printf '%s\n' "$out" | grep -c 'OVERRIDDEN-BY-OVERLAY' || true)
-            # SET_PER_OVERLAY is the third spelling of a placeholder, as the
-            # platform repository's pre-commit hook counts it since 15 Sep.
+            # SET_PER_OVERLAY is a placeholder too.
             n_ph=$(printf  '%s\n' "$out" | grep -cE 'PLACEHOLDER|PASTE_[A-Z_]|SET_PER_OVERLAY' || true)
 
             [ "$n_tag" -gt 0 ] && { echo "::error::overlays/$e has an image with an empty tag"; bad=1; }
             [ "$n_ang" -gt 0 ] && { echo "::error::overlays/$e has angle brackets in an image reference"; bad=1; }
 
-            # OVERRIDDEN-BY-OVERLAY marks a value an overlay MUST supply — a
-            # namespaced Traefik middleware reference. Unresolved it is a broken
-            # Ingress in ANY overlay, not an unfinished environment.
+            # OVERRIDDEN-BY-OVERLAY must always be resolved by an overlay.
             [ "$n_ovr" -gt 0 ] && { echo "::error::overlays/$e leaves OVERRIDDEN-BY-OVERLAY unresolved"; bad=1; }
 
             # PLACEHOLDER is legitimate in an environment that is not yet built.
@@ -420,17 +310,9 @@ jobs:
               echo "::error::the DEV overlay still contains a placeholder"; bad=1
             fi
 
-            # Did the tag this run recorded actually land? A release written
-            # into `_images` that an overlay does not include — a new
-            # Application whose kustomization skips `_shared`, say — renders
-            # fine and changes nothing: the environment keeps whatever base/
-            # says, which on `main` is DEV's tag. So every place this service's
-            # image appears must now carry the new tag. A service an environment
-            # does not run yet (UAT before it is fully built) is a notice, not
-            # a failure: the tag waits in `_images` until it does.
-            #
-            # The trailing colon matters: farm-assistant must not count
-            # farm-assistant-hermes.
+            # Every reference to this image in the target environments must carry the
+            # new tag. A service an environment does not run yet is only a notice.
+            # The trailing colon keeps farm-assistant from matching farm-assistant-hermes.
             n_svc=$(printf '%s\n' "$out" | grep -cF "image: $IMG:" || true)
             n_new=$(printf '%s\n' "$out" | grep -cF "image: $IMG:$TAG" || true)
             case " $targets " in *" $e "*)
@@ -464,8 +346,7 @@ jobs:
           fi
           git commit -m "$subject" -m "From ${{ github.repository }}@${{ github.sha }} (${{ github.ref_name }})"
 
-          # Another service may have pushed while this job was building. Rebase
-          # and retry rather than failing the deploy.
+          # Rebase and retry if another run pushed in the meantime.
           for i in 1 2 3 4 5; do
             git pull --rebase --quiet origin "$BRANCH" && \
             git push origin HEAD:"$BRANCH" && exit 0
@@ -488,7 +369,7 @@ jobs:
             echo "| platform branch | \`${{ steps.route.outputs.platform_ref }}\` |"
             if [ "$MODE" = dev ]; then
               echo "| deployed to | DEV (automatically, within a few minutes) |"
-              echo "| UAT, PRD | unchanged — they take releases from \`main\` |"
+              echo "| UAT, PRD | unchanged - they take releases from \`main\` |"
             else
               echo "| deployed to | UAT (automatically, within a few minutes) |"
               echo "| PRD | recorded; runs it only after a manual Sync in Argo CD |"
